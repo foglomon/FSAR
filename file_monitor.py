@@ -7,7 +7,7 @@ import platform
 import difflib
 from pathlib import Path
 from datetime import datetime, timedelta
-
+from difflib import SequenceMatcher
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from rich.console import Console
@@ -108,6 +108,8 @@ class Monitor:
                     try:
                         content = p.read_text(encoding='utf-8', errors='ignore')
                         self.contents[str(p)] = content
+                        # Store original content as backup for diff
+                        self.backups[str(p)] = content
                     except Exception:
                         pass
         except Exception:
@@ -119,11 +121,16 @@ class Monitor:
             
         try:
             path_str = str(path)
-            current = self.contents.get(path_str, "")
             
-            # Always store backup - empty string for new files
-            self.backups[path_str] = current
+            # If observed for the first time, store current content as backup
+            if path_str not in self.backups:
+                try:
+                    current = path.read_text(encoding='utf-8', errors='ignore')
+                    self.backups[path_str] = current
+                except Exception:
+                    self.backups[path_str] = ""
             
+            # Update current content
             new = path.read_text(encoding='utf-8', errors='ignore')
             self.contents[path_str] = new
         except Exception:
@@ -172,14 +179,42 @@ class Monitor:
         old_lines = old.splitlines(keepends=True)
         new_lines = new.splitlines(keepends=True)
         
-        diff = list(difflib.unified_diff(
-            old_lines, new_lines,
-            fromfile=f"{path.name} (before)",
-            tofile=f"{path.name} (after)",
-            n=3
-        ))
+        if len(old_lines) <= 10 and len(new_lines) <= 15:
+            diff = self._create_simple_diff(old_lines, new_lines, path.name)
+        else:
+            diff = list(difflib.unified_diff(
+                old_lines, new_lines,
+                fromfile=f"{path.name} (before)",
+                tofile=f"{path.name} (after)",
+                n=3
+            ))
         
         return diff if diff else None
+    
+    def _create_simple_diff(self, old_lines, new_lines, filename):
+        diff = []
+        diff.append(f"--- {filename} (before)\n")
+        diff.append(f"+++ {filename} (after)\n")
+        
+        matcher = SequenceMatcher(None, old_lines, new_lines)
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                for i in range(i1, i2):
+                    diff.append(f"  {old_lines[i]}")
+            elif tag == 'delete':
+                for i in range(i1, i2):
+                    diff.append(f"- {old_lines[i]}")
+            elif tag == 'insert':
+                for j in range(j1, j2):
+                    diff.append(f"+ {new_lines[j]}")
+            elif tag == 'replace':
+                for i in range(i1, i2):
+                    diff.append(f"- {old_lines[i]}")
+                for j in range(j1, j2):
+                    diff.append(f"+ {new_lines[j]}")
+        
+        return diff
     
     def handle_diff_input(self, key):
         if key == 'q' or key == 'Q':
@@ -385,9 +420,9 @@ class Monitor:
                           border_style="blue" if dir_exists else "red")
         
         instructions = []
-        if hasattr(self, 'file_idx') and self.file_idx:
-            instructions.append("[dim]Type a number [bold cyan][1-N][/bold cyan] to view file diffs • [/dim]")
         instructions.append("[dim]Press Ctrl+C to access menu (change path, toggle chime, exit)[/dim]")
+        if hasattr(self, 'file_idx') and self.file_idx:
+            instructions.append("[dim] and view diffs.[/dim]")
         instructions_text = "".join(instructions)
         
         from rich.layout import Layout
@@ -430,9 +465,14 @@ class Monitor:
         self.changed.clear()
         self.created.clear()
         self.deleted.clear()
+        self.contents.clear()
+        self.backups.clear()
         
         self.dir = new_dir
         self.chime_file = self.dir / "chime.mp3"
+        
+        # Reinitialize contents and backups for the new directory
+        self._init_contents()
         
         self.start_monitoring()
         
@@ -639,6 +679,7 @@ class Monitor:
 
 
 def main():
+    os.system('cls' if os.name == 'nt' else 'clear')
     console = Console()
     
     console.print("[bold blue]🚀 File System Activity Monitor[/bold blue]")
