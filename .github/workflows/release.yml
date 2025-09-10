@@ -101,7 +101,7 @@ jobs:
             - macOS: FSAR-macos
 
             Built on: ${{ github.run_number }} - ${{ github.sha }}
-          draft: false
+          draft: true
           prerelease: false
 
       - name: Upload Windows binary
