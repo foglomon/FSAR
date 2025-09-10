@@ -16,6 +16,16 @@ from rich.live import Live
 from rich.panel import Panel
 
 
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
 
 class Handler(FileSystemEventHandler):
     def __init__(self, mon):
@@ -46,7 +56,20 @@ class Monitor:
         self.observer = None
         self.running = False
         self.chime = enable_chime
-        self.chime_file = self.dir / "chime.mp3"
+        
+        # Try to find chime.mp3 in multiple locations
+        self.chime_file = None
+        if enable_chime:
+            # First try the resource path (for PyInstaller)
+            resource_chime = Path(get_resource_path("chime.mp3"))
+            if resource_chime.exists():
+                self.chime_file = resource_chime
+            else:
+                # Fallback to directory being monitored
+                dir_chime = self.dir / "chime.mp3"
+                if dir_chime.exists():
+                    self.chime_file = dir_chime
+        
         self.input = ""
         self.lock = threading.Lock()
         self.diff_file = None
@@ -59,19 +82,41 @@ class Monitor:
             raise ValueError(f"Directory does not exist: {directory}")
             
     def play_chime(self):
-        if not self.chime or not self.chime_file.exists():
+        if not self.chime or not self.chime_file or not self.chime_file.exists():
             return
             
         try:
             system = platform.system().lower()
             if system == "windows":
-                subprocess.Popen([
-                    "powershell", "-c", 
-                    f"Add-Type -AssemblyName presentationCore; "
-                    f"$mediaPlayer = New-Object system.windows.media.mediaplayer; "
-                    f"$mediaPlayer.open([uri]'{self.chime_file}'); "
-                    f"$mediaPlayer.Play(); Start-Sleep 1; $mediaPlayer.Stop()"
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Try multiple Windows audio methods
+                methods = [
+                    # Method 1: PowerShell with error handling
+                    lambda: subprocess.run([
+                        "powershell", "-ExecutionPolicy", "Bypass", "-NoProfile", "-c", 
+                        f"try {{ Add-Type -AssemblyName presentationCore; "
+                        f"$mediaPlayer = New-Object system.windows.media.mediaplayer; "
+                        f"$mediaPlayer.open([uri]'{self.chime_file}'); "
+                        f"$mediaPlayer.Play(); Start-Sleep 1; $mediaPlayer.Stop() }} catch {{}}"
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5),
+                    
+                    # Method 2: Windows Media Player command line
+                    lambda: subprocess.run([
+                        "cmd", "/c", f'start /min wmplayer /close "{self.chime_file}"'
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5),
+                    
+                    # Method 3: System beep as fallback
+                    lambda: subprocess.run([
+                        "cmd", "/c", "echo \a"
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                ]
+                
+                for method in methods:
+                    try:
+                        method()
+                        break  # If successful, don't try other methods
+                    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+                        continue
+                        
             elif system == "darwin":
                 subprocess.Popen(["afplay", str(self.chime_file)], 
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -469,7 +514,15 @@ class Monitor:
         self.backups.clear()
         
         self.dir = new_dir
-        self.chime_file = self.dir / "chime.mp3"
+        
+        # Update chime file path - try resource path first, then directory
+        if self.chime:
+            resource_chime = Path(get_resource_path("chime.mp3"))
+            if resource_chime.exists():
+                self.chime_file = resource_chime
+            else:
+                dir_chime = self.dir / "chime.mp3"
+                self.chime_file = dir_chime if dir_chime.exists() else None
         
         # Reinitialize contents and backups for the new directory
         self._init_contents()
@@ -717,9 +770,20 @@ def main():
     console.print(f"  🔔 Chime: {status}")
     
     if chime:
-        chime_file = path / "chime.mp3"
-        if not chime_file.exists():
-            console.print(f"  [yellow]⚠️ Note: chime.mp3 not found in {path}[/yellow]")
+        # Check for chime.mp3 in multiple locations
+        chime_locations = [
+            Path(get_resource_path("chime.mp3")),  # PyInstaller resource
+            path / "chime.mp3",  # Current directory
+        ]
+        
+        chime_found = False
+        for chime_file in chime_locations:
+            if chime_file.exists():
+                chime_found = True
+                break
+                
+        if not chime_found:
+            console.print(f"  [yellow]⚠️ Note: chime.mp3 not found in any expected location[/yellow]")
             console.print(f"  [dim]Audio notifications will be disabled until chime.mp3 is available[/dim]")
     
     console.print("\n[dim]Starting monitor...[/dim]")

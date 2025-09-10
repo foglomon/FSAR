@@ -21,7 +21,6 @@ An application that displays a directory tree and lights up files/folders with d
   - **[NEW]** tag - Newly created files and directories (shown after filename)
   - **[EDITED]** tag - Recently modified files (shown after filename)
 
-
 ## Installation
 
 ### Download Pre-built Binaries
@@ -29,16 +28,20 @@ An application that displays a directory tree and lights up files/folders with d
 Head to [releases](https://github.com/foglomon/FSAR/releases/latest) and download the executable for your OS:
 
 #### Windows
+
 1. Download `FSAR-windows.exe`
-2. Double-click to run, or run from command prompt: `FSAR-windows.exe`
+2. **Important**: If Windows shows a warning or blocks the file, see [Windows Troubleshooting](#windows-troubleshooting) below
+3. Double-click to run, or run from command prompt: `FSAR-windows.exe`
 
 #### Linux
+
 1. Download `FSAR-linux`
 2. Make it executable: `chmod +x FSAR-linux`
 3. Run: `./FSAR-linux`
 4. (Optional) Move to PATH: `sudo cp FSAR-linux /usr/local/bin/fsar`
 
 #### macOS
+
 1. Download `FSAR-macos`
 2. Make it executable: `chmod +x FSAR-macos`
 3. First run: `./FSAR-macos` (macOS may show security warning)
@@ -90,3 +93,51 @@ Perfect for:
 - Debugging file operations
 - Understanding which files your applications touch
 
+## Windows Troubleshooting
+
+### "Windows cannot access the specified device, path or file" Error
+
+This error commonly occurs with PyInstaller-compiled executables on Windows. Here are solutions:
+
+#### 1. Windows Defender / Antivirus
+
+- **Right-click** the executable → **Properties** → **Unblock** (if checkbox exists)
+- Add the executable to your antivirus **whitelist/exclusions**
+- Temporarily disable **Real-time protection** in Windows Defender to test
+
+#### 2. Run as Administrator
+
+- **Right-click** the executable → **Run as administrator**
+
+#### 3. Alternative Download Methods
+
+- Try downloading with a different browser
+- Download to a different location (avoid Desktop/Downloads)
+- Use `Ctrl+Shift+S` in browser to "Save As" instead of direct download
+
+#### 4. PowerShell Execution Policy (for audio chimes)
+
+If chime notifications don't work:
+
+```powershell
+# Run PowerShell as Administrator and execute:
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+#### 5. SmartScreen Filter
+
+If Windows SmartScreen blocks execution:
+
+- Click **"More info"** → **"Run anyway"**
+- Or go to **Windows Security** → **App & browser control** → **Reputation-based protection** → Temporarily disable
+
+#### 6. File Location
+
+- Move the executable to a folder like `C:\Tools\` instead of Desktop/Downloads
+- Avoid paths with spaces or special characters
+
+### Still Having Issues?
+
+1. Try running from **Command Prompt** or **PowerShell** to see error details
+2. Check Windows Event Viewer for security-related blocks
+3. Create an issue on GitHub with your specific error message

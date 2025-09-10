@@ -17,7 +17,6 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: FSAR-windows.exe
-            pyinstaller_args: --onefile --windowed
           - os: ubuntu-latest
             artifact_name: FSAR-linux
             pyinstaller_args: --onefile
@@ -43,7 +42,11 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller ${{ matrix.pyinstaller_args }} --name ${{ matrix.artifact_name }} FSAR.py
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            pyinstaller .github/FSAR-windows.spec
+          else
+            pyinstaller ${{ matrix.pyinstaller_args }} --name ${{ matrix.artifact_name }} FSAR.py
+          fi
         shell: bash
 
       - name: Upload artifact
