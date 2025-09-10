@@ -3,10 +3,10 @@
 block_cipher = None
 
 a = Analysis(
-    ['FSAR.py'],
+    ['../FSAR.py'],
     pathex=[],
     binaries=[],
-    datas=[('chime.mp3', '.')],
+    datas=[('../chime.mp3', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
