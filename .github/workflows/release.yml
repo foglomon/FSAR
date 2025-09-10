@@ -45,7 +45,7 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             pyinstaller .github/FSAR-windows.spec
           else
-            pyinstaller ${{ matrix.pyinstaller_args }} --name ${{ matrix.artifact_name }} FSAR.py
+            pyinstaller ${{ matrix.pyinstaller_args }} --icon logo.ico --name ${{ matrix.artifact_name }} FSAR.py
           fi
         shell: bash
 
