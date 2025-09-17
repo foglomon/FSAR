@@ -40,16 +40,6 @@ jobs:
           pip install pyinstaller
         shell: bash
 
-      - name: Verify dependencies
-        run: |
-          echo "Installed packages:"
-          pip list
-          echo "Testing imports..."
-          python -c "import watchdog; print('watchdog: OK')"
-          python -c "import rich; print('rich: OK')"
-          python -c "try: import curses; print('curses: OK'); except ImportError as e: print('curses: FAILED -', e)"
-        shell: bash
-
       - name: Build executable with PyInstaller
         run: |
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
