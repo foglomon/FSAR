@@ -5,10 +5,7 @@ import threading
 import subprocess
 import platform
 import difflib
-try:
-    import curses
-except ImportError:
-    curses = None
+import curses
 from pathlib import Path
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
