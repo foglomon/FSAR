@@ -5,6 +5,10 @@ import threading
 import subprocess
 import platform
 import difflib
+try:
+    import curses
+except ImportError:
+    curses = None
 from pathlib import Path
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -57,15 +61,21 @@ class Monitor:
         self.running = False
         self.chime = enable_chime
         
-        # Try to find chime.mp3 in multiple locations
+        self.scroll_offset = 0
+        self.tree_height = 0
+        self.visible_lines = 30
+        self.most_recent_file = None
+        self.most_recent_time = None
+        self.input_thread = None
+        self.input_queue = []
+        self.input_lock = threading.Lock()
+        
         self.chime_file = None
         if enable_chime:
-            # First try the resource path (for PyInstaller)
             resource_chime = Path(get_resource_path("chime.mp3"))
             if resource_chime.exists():
                 self.chime_file = resource_chime
             else:
-                # Fallback to directory being monitored
                 dir_chime = self.dir / "chime.mp3"
                 if dir_chime.exists():
                     self.chime_file = dir_chime
@@ -88,9 +98,7 @@ class Monitor:
         try:
             system = platform.system().lower()
             if system == "windows":
-                # Try multiple Windows audio methods
                 methods = [
-                    # Method 1: PowerShell with error handling
                     lambda: subprocess.run([
                         "powershell", "-ExecutionPolicy", "Bypass", "-NoProfile", "-c", 
                         f"try {{ Add-Type -AssemblyName presentationCore; "
@@ -99,12 +107,10 @@ class Monitor:
                         f"$mediaPlayer.Play(); Start-Sleep 1; $mediaPlayer.Stop() }} catch {{}}"
                     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5),
                     
-                    # Method 2: Windows Media Player command line
                     lambda: subprocess.run([
                         "cmd", "/c", f'start /min wmplayer /close "{self.chime_file}"'
                     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5),
                     
-                    # Method 3: System beep as fallback
                     lambda: subprocess.run([
                         "cmd", "/c", "echo \a"
                     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
@@ -113,7 +119,7 @@ class Monitor:
                 for method in methods:
                     try:
                         method()
-                        break  # If successful, don't try other methods
+                        break
                     except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
                         continue
                         
@@ -136,6 +142,9 @@ class Monitor:
         t = datetime.now()
         self.changed[path] = (t, event)
         
+        self.most_recent_file = Path(path).name
+        self.most_recent_time = t
+        
         if event == 'deleted':
             self.deleted[path] = t
         elif event == 'created':
@@ -153,7 +162,6 @@ class Monitor:
                     try:
                         content = p.read_text(encoding='utf-8', errors='ignore')
                         self.contents[str(p)] = content
-                        # Store original content as backup for diff
                         self.backups[str(p)] = content
                     except Exception:
                         pass
@@ -167,7 +175,6 @@ class Monitor:
         try:
             path_str = str(path)
             
-            # If observed for the first time, store current content as backup
             if path_str not in self.backups:
                 try:
                     current = path.read_text(encoding='utf-8', errors='ignore')
@@ -175,7 +182,6 @@ class Monitor:
                 except Exception:
                     self.backups[path_str] = ""
             
-            # Update current content
             new = path.read_text(encoding='utf-8', errors='ignore')
             self.contents[path_str] = new
         except Exception:
@@ -342,11 +348,133 @@ class Monitor:
             tree.add("[dim yellow]Press Ctrl+C to change to a different directory[/dim yellow]")
             return tree
             
-        tree = Tree(f"📁 [bold blue]{self.dir.name}[/bold blue]")
+        tree_items = []
+        self._collect_tree_items(self.dir, tree_items)
+        self.tree_height = len(tree_items)
+        
+        visible_count = self._calculate_visible_lines()
+        
+        visible_items = tree_items[self.scroll_offset:self.scroll_offset + visible_count]
+        
+        end_line = min(self.scroll_offset + visible_count, self.tree_height)
+        tree = Tree(f"📁 [bold blue]{self.dir.name}[/bold blue] (line {self.scroll_offset + 1}-{end_line} of {self.tree_height})")
         self.file_idx = {}
         self.idx = 1
-        self._add_dir(tree, self.dir)
+        
+        for item_info in visible_items:
+            self._add_tree_item(tree, item_info)
+        
+        if self.scroll_offset + visible_count >= self.tree_height and self.tree_height > 0:
+            tree.add("[dim cyan]📁 End of directory tree[/dim cyan]")
+        
         return tree
+    
+    def _calculate_visible_lines(self):
+        try:
+            columns, rows = os.get_terminal_size()
+            
+            # Calculate space used by other panels:
+            # - Info panel: ~5-6 lines
+            # - Instructions panel: ~4-5 lines  
+            # - Rich panel borders and margins: ~4 lines
+            # - Some buffer space: ~2 lines
+            used_space = 16
+            
+            available_lines = max(10, rows - used_space)
+            
+            self.visible_lines = available_lines
+            return available_lines
+        except Exception:
+            self.visible_lines = 30
+            return 30
+    
+    def _collect_tree_items(self, directory, items, depth=0, max_depth=10):
+        if depth >= max_depth or not directory.exists():
+            return
+            
+        try:
+            dir_items = sorted(directory.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+            
+            for deleted_path in list(self.deleted.keys()):
+                deleted_file = Path(deleted_path)
+                if deleted_file.parent == directory and self.is_deleted(deleted_file):
+                    dir_items.append(deleted_file)
+            
+            for item in dir_items:
+                if item.name.startswith('.'):
+                    continue
+                
+                item_info = {
+                    'path': item,
+                    'depth': depth,
+                    'is_dir': item.is_dir() and item.exists()
+                }
+                items.append(item_info)
+                
+                if item.is_dir() and item.exists():
+                    self._collect_tree_items(item, items, depth + 1, max_depth)
+                    
+        except (PermissionError, FileNotFoundError, OSError):
+            pass
+    
+    def _add_tree_item(self, tree_node, item_info):
+        item = item_info['path']
+        depth = item_info['depth']
+        is_dir = item_info['is_dir']
+        
+        # Create indentation for nested items
+        indent = "  " * depth
+        
+        color, style = self.get_color_style(item)
+        
+        if is_dir:
+            icon = "📁"
+            new_tag = " [bold green][NEW][/bold green]" if self.is_created(item) else ""
+            
+            if style:
+                text = f"{indent}{icon} [{color} {style}]{item.name}/[/{style} {color}]{new_tag}"
+            else:
+                text = f"{indent}{icon} [{color}]{item.name}/[/{color}]{new_tag}"
+            
+            tree_node.add(text)
+        else:
+            event = self.get_event(item)
+            
+            if event == 'created':
+                icon = "📄"
+            elif event == 'deleted':
+                icon = "🗑️ "
+            else:
+                icon = "📄"
+            
+            size_str = ""
+            if item.exists():
+                try:
+                    size = item.stat().st_size
+                    if size < 1024:
+                        size_str = f" [dim]({size}B)[/dim]"
+                    elif size < 1024 * 1024:
+                        size_str = f" [dim]({size/1024:.1f}KB)[/dim]"
+                    else:
+                        size_str = f" [dim]({size/(1024*1024):.1f}MB)[/dim]"
+                except:
+                    size_str = ""
+            
+            diff_button = ""
+            if self._is_text(item) and self.get_diff(item) is not None:
+                self.file_idx[self.idx] = str(item)
+                diff_button = f"[bold cyan][[{self.idx}]][/bold cyan] "
+                self.idx += 1
+            
+            new_tag = " [bold green][NEW][/bold green]" if event == 'created' else ""
+            edited_tag = " [bold yellow][EDITED][/bold yellow]" if (event == 'modified' and event != 'created') else ""
+            
+            if style:
+                node_text = f"{indent}{diff_button}{icon} [{color} {style}]{item.name}[/{style} {color}]{new_tag}{edited_tag}{size_str}"
+            else:
+                node_text = f"{indent}{diff_button}{icon} [{color}]{item.name}[/{color}]{new_tag}{edited_tag}{size_str}"
+                
+            tree_node.add(node_text)
         
     def _add_dir(self, tree_node, directory, max_depth=10, depth=0):
         if depth >= max_depth:
@@ -464,14 +592,34 @@ class Monitor:
         tree_panel = Panel(tree, title="[bold blue]Directory Tree[/bold blue]", 
                           border_style="blue" if dir_exists else "red")
         
+        # Build instructions with navigation and recent file info
         instructions = []
         instructions.append("[dim]Press Ctrl+C to access menu (change path, toggle chime, exit)[/dim]")
         if hasattr(self, 'file_idx') and self.file_idx:
             instructions.append("[dim] and view diffs.[/dim]")
+        instructions.append("\n[dim]Navigation: [/dim][cyan]W/↑[/cyan][dim] scroll up, [/dim][cyan]S/↓[/cyan][dim] scroll down, [/dim][cyan]PgUp[/cyan][dim] page up, [/dim][cyan]PgDn[/cyan][dim] page down[/dim]")
+        
+        if self.most_recent_file:
+            time_ago = ""
+            if self.most_recent_time:
+                seconds_ago = (datetime.now() - self.most_recent_time).total_seconds()
+                if seconds_ago < 60:
+                    time_ago = f" ({int(seconds_ago)}s ago)"
+                elif seconds_ago < 3600:
+                    time_ago = f" ({int(seconds_ago/60)}m ago)"
+                else:
+                    time_ago = f" ({int(seconds_ago/3600)}h ago)"
+            instructions.append(f"\n[bold yellow]📄 Most Recent Event:[/bold yellow] [bold magenta]{self.most_recent_file}[/bold magenta]{time_ago} [dim]- Press [/dim][cyan]F[/cyan][dim] to jump[/dim]")
+        else:
+            instructions.append(f"\n[dim]No recent file events[/dim]")
+        
         instructions_text = "".join(instructions)
         
         from rich.layout import Layout
         layout = Layout()
+        
+        instruction_lines = instructions_text.count('\n') + 1
+        instruction_panel_size = max(3, min(6, instruction_lines + 2))
         
         if self.diff_file:
             diff = self.get_diff(Path(self.diff_file))
@@ -483,19 +631,19 @@ class Monitor:
                     Layout(info_panel, size=6 if not dir_exists else 5),
                     Layout(tree_panel),
                     Layout(diff_panel),
-                    Layout(Panel(instructions_text + " • [dim]Press 'q' to close diff[/dim]", border_style="dim"), size=3)
+                    Layout(Panel(instructions_text + " • [dim]Press 'q' to close diff[/dim]", border_style="dim"), size=instruction_panel_size)
                 )
             else:
                 layout.split_column(
                     Layout(info_panel, size=6 if not dir_exists else 5),
                     Layout(tree_panel),
-                    Layout(Panel(instructions_text, border_style="dim"), size=3)
+                    Layout(Panel(instructions_text, border_style="dim"), size=instruction_panel_size)
                 )
         else:
             layout.split_column(
                 Layout(info_panel, size=6 if not dir_exists else 5),
                 Layout(tree_panel),
-                Layout(Panel(instructions_text, border_style="dim"), size=3)
+                Layout(Panel(instructions_text, border_style="dim"), size=instruction_panel_size)
             )
         
         return layout
@@ -513,9 +661,12 @@ class Monitor:
         self.contents.clear()
         self.backups.clear()
         
+        self.scroll_offset = 0
+        self.most_recent_file = None
+        self.most_recent_time = None
+        
         self.dir = new_dir
         
-        # Update chime file path - try resource path first, then directory
         if self.chime:
             resource_chime = Path(get_resource_path("chime.mp3"))
             if resource_chime.exists():
@@ -524,7 +675,6 @@ class Monitor:
                 dir_chime = self.dir / "chime.mp3"
                 self.chime_file = dir_chime if dir_chime.exists() else None
         
-        # Reinitialize contents and backups for the new directory
         self._init_contents()
         
         self.start_monitoring()
@@ -538,6 +688,9 @@ class Monitor:
         event_handler = Handler(self)
         self.observer.schedule(event_handler, str(self.dir), recursive=True)
         self.observer.start()
+        
+        self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
+        self.input_thread.start()
         
     def check_dir_exists(self):
         return self.dir.exists()
@@ -557,6 +710,9 @@ class Monitor:
         self.console.print(f"[dim]Chime: {chime_status} | Interactive controls available during monitoring[/dim]")
         
         self.start_monitoring()
+        
+        self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
+        self.input_thread.start()
         
         try:
             with Live(self.create_display(), refresh_per_second=2, screen=True) as live:
@@ -594,6 +750,12 @@ class Monitor:
                                     self.change_path(new_path)
                                     self.console.print(f"[green]✅ Now monitoring: {self.dir}[/green]")
                                     self.console.print("[green]Resuming monitoring... (Press Ctrl+C again to return to menu)[/green]")
+                                    self.start_monitoring()
+                                    
+                                    # Start input handler thread for keyboard navigation
+                                    self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
+                                    self.input_thread.start()
+                                    
                                     with Live(self.create_display(), refresh_per_second=2, screen=True) as live:
                                         counter = 0
                                         while self.running:
@@ -651,6 +813,10 @@ class Monitor:
                         elif choice == '4':
                             self.console.print("[green]Resuming monitoring... (Press Ctrl+C again to return to menu)[/green]")
                             self.start_monitoring()
+                            
+                            self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
+                            self.input_thread.start()
+                            
                             with Live(self.create_display(), refresh_per_second=2, screen=True) as live:
                                 counter = 0
                                 while self.running:
@@ -728,7 +894,76 @@ class Monitor:
             self.console.print("[red]Invalid input. Please enter a number.[/red]")
             
     def _input_handler(self):
-        pass
+        try:
+            stdscr = curses.initscr()
+            curses.noecho()
+            curses.cbreak()
+            stdscr.keypad(True)
+            stdscr.nodelay(True)
+            
+            while self.running:
+                try:
+                    key = stdscr.getch()
+                    if key != -1:
+                        if key == curses.KEY_UP or key == ord('w') or key == ord('W'):
+                            self._scroll_up()
+                        elif key == curses.KEY_DOWN or key == ord('s') or key == ord('S'):
+                            self._scroll_down()
+                        elif key == curses.KEY_PPAGE:
+                            self._page_up()
+                        elif key == curses.KEY_NPAGE:
+                            self._page_down()
+                        elif key == ord('f') or key == ord('F'):
+                            self._jump_to_recent_file()
+                    time.sleep(0.05)
+                except curses.error:
+                    time.sleep(0.1)
+        except Exception:
+            pass
+        finally:
+            try:
+                curses.endwin()
+            except:
+                pass
+    
+    def _scroll_up(self):
+        self.scroll_offset = max(0, self.scroll_offset - 5)
+    
+    def _scroll_down(self):
+        max_scroll = max(0, self.tree_height - self.visible_lines)
+        self.scroll_offset = min(max_scroll, self.scroll_offset + 5)
+    
+    def _page_up(self):
+        self.scroll_offset = max(0, self.scroll_offset - self.visible_lines)
+    
+    def _page_down(self):
+        max_scroll = max(0, self.tree_height - self.visible_lines)
+        self.scroll_offset = min(max_scroll, self.scroll_offset + self.visible_lines)
+    
+    def _jump_to_recent_file(self):
+        if not self.most_recent_file:
+            return
+        
+        try:
+            file_position = self._find_file_position(self.most_recent_file)
+            if file_position is not None:
+                # Set scroll offset to show the recent file, with some context above
+                context_lines = min(5, self.visible_lines // 4)
+                self.scroll_offset = max(0, file_position - context_lines)
+        except Exception:
+            pass
+    
+    def _find_file_position(self, filename):
+        try:
+            tree_items = []
+            self._collect_tree_items(self.dir, tree_items)
+            
+            for i, item_info in enumerate(tree_items):
+                if item_info['path'].name == filename:
+                    return i
+            return None
+        except Exception:
+            return None
 
 
 def main():
@@ -770,10 +1005,9 @@ def main():
     console.print(f"  🔔 Chime: {status}")
     
     if chime:
-        # Check for chime.mp3 in multiple locations
         chime_locations = [
-            Path(get_resource_path("chime.mp3")),  # PyInstaller resource
-            path / "chime.mp3",  # Current directory
+            Path(get_resource_path("chime.mp3")),
+            path / "chime.mp3",
         ]
         
         chime_found = False

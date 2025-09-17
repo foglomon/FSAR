@@ -40,13 +40,27 @@ jobs:
           pip install pyinstaller
         shell: bash
 
+      - name: Verify dependencies
+        run: |
+          echo "Installed packages:"
+          pip list
+          echo "Testing imports..."
+          python -c "import watchdog; print('watchdog: OK')"
+          python -c "import rich; print('rich: OK')"
+          python -c "try: import curses; print('curses: OK'); except ImportError as e: print('curses: FAILED -', e)"
+        shell: bash
+
       - name: Build executable with PyInstaller
         run: |
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "Building Windows executable with spec file..."
             pyinstaller .github/FSAR-windows.spec
           else
-            pyinstaller ${{ matrix.pyinstaller_args }} --icon logo.ico --name ${{ matrix.artifact_name }} FSAR.py
+            echo "Building ${{ matrix.os }} executable..."
+            pyinstaller ${{ matrix.pyinstaller_args }} --icon logo.ico --name ${{ matrix.artifact_name }} --hidden-import curses --hidden-import _curses FSAR.py
           fi
+          echo "Build completed. Contents of dist directory:"
+          ls -la dist/
         shell: bash
 
       - name: Upload artifact
