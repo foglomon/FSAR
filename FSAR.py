@@ -5,7 +5,6 @@ import threading
 import subprocess
 import platform
 import difflib
-import curses
 from pathlib import Path
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -15,6 +14,11 @@ from rich.console import Console
 from rich.tree import Tree
 from rich.live import Live
 from rich.panel import Panel
+from prompt_toolkit import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.layout import Layout as PTKLayout
+from prompt_toolkit.keys import Keys
 
 
 def get_resource_path(relative_path):
@@ -77,6 +81,12 @@ class Monitor:
                 if dir_chime.exists():
                     self.chime_file = dir_chime
         
+        # Chime batching to prevent audio spam
+        self.chime_counter = 0
+        self.chime_batch_size = 10  # Play chime every 10 changes
+        self.last_chime_time = datetime.now()
+        self.chime_cooldown = 1.0  # Minimum 1 second between chimes
+        
         self.input = ""
         self.lock = threading.Lock()
         self.diff_file = None
@@ -95,6 +105,7 @@ class Monitor:
         try:
             system = platform.system().lower()
             if system == "windows":
+                # Try PowerShell method first, then fallback to system beep
                 methods = [
                     lambda: subprocess.run([
                         "powershell", "-ExecutionPolicy", "Bypass", "-NoProfile", "-c", 
@@ -104,10 +115,7 @@ class Monitor:
                         f"$mediaPlayer.Play(); Start-Sleep 1; $mediaPlayer.Stop() }} catch {{}}"
                     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5),
                     
-                    lambda: subprocess.run([
-                        "cmd", "/c", f'start /min wmplayer /close "{self.chime_file}"'
-                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5),
-                    
+                    # System beep as fallback (no annoying windows)
                     lambda: subprocess.run([
                         "cmd", "/c", "echo \a"
                     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
@@ -134,6 +142,31 @@ class Monitor:
                         continue
         except Exception:
             pass
+    
+    def _should_play_chime(self):
+        """Determine if chime should play based on batching logic"""
+        now = datetime.now()
+        
+        # Increment counter for each change
+        self.chime_counter += 1
+        
+        # Check if enough time has passed since last chime (cooldown)
+        time_since_last_chime = (now - self.last_chime_time).total_seconds()
+        
+        # Play chime if:
+        # 1. We've reached the batch size (every 10 changes), OR
+        # 2. It's been more than 3 seconds since last chime (for isolated changes)
+        should_play = (
+            self.chime_counter >= self.chime_batch_size or 
+            time_since_last_chime > 3.0
+        )
+        
+        if should_play and time_since_last_chime >= self.chime_cooldown:
+            self.chime_counter = 0  # Reset counter
+            self.last_chime_time = now
+            return True
+        
+        return False
             
     def mark_changed(self, path, event='modified'):
         t = datetime.now()
@@ -146,8 +179,10 @@ class Monitor:
             self.deleted[path] = t
         elif event == 'created':
             self.created[path] = t
-            
-        threading.Thread(target=self.play_chime, daemon=True).start()
+        
+        # Use batched chime logic to prevent audio spam
+        if self._should_play_chime():
+            threading.Thread(target=self.play_chime, daemon=True).start()
         
         if event in ['modified', 'created'] and Path(path).is_file():
             self._update_content(Path(path))
@@ -594,6 +629,8 @@ class Monitor:
         instructions.append("[dim]Press Ctrl+C to access menu (change path, toggle chime, exit)[/dim]")
         if hasattr(self, 'file_idx') and self.file_idx:
             instructions.append("[dim] and view diffs.[/dim]")
+        
+        # Show navigation instructions (works with prompt_toolkit or fallback)
         instructions.append("\n[dim]Navigation: [/dim][cyan]W/↑[/cyan][dim] scroll up, [/dim][cyan]S/↓[/cyan][dim] scroll down, [/dim][cyan]PgUp[/cyan][dim] page up, [/dim][cyan]PgDn[/cyan][dim] page down[/dim]")
         
         if self.most_recent_file:
@@ -606,6 +643,8 @@ class Monitor:
                     time_ago = f" ({int(seconds_ago/60)}m ago)"
                 else:
                     time_ago = f" ({int(seconds_ago/3600)}h ago)"
+            
+            # Show jump instruction on all platforms
             instructions.append(f"\n[bold yellow]📄 Most Recent Event:[/bold yellow] [bold magenta]{self.most_recent_file}[/bold magenta]{time_ago} [dim]- Press [/dim][cyan]F[/cyan][dim] to jump[/dim]")
         else:
             instructions.append(f"\n[dim]No recent file events[/dim]")
@@ -891,37 +930,47 @@ class Monitor:
             self.console.print("[red]Invalid input. Please enter a number.[/red]")
             
     def _input_handler(self):
+        """Cross-platform input handler using prompt_toolkit"""
+        bindings = KeyBindings()
+        
+        @bindings.add('w')
+        @bindings.add('W')
+        @bindings.add(Keys.Up)
+        def scroll_up_handler(event):
+            self._scroll_up()
+        
+        @bindings.add('s')
+        @bindings.add('S')
+        @bindings.add(Keys.Down)
+        def scroll_down_handler(event):
+            self._scroll_down()
+        
+        @bindings.add(Keys.PageUp)
+        def page_up_handler(event):
+            self._page_up()
+        
+        @bindings.add(Keys.PageDown)
+        def page_down_handler(event):
+            self._page_down()
+        
+        @bindings.add('f')
+        @bindings.add('F')
+        def jump_handler(event):
+            self._jump_to_recent_file()
+        
+        app = Application(
+            layout=PTKLayout(Window()),
+            key_bindings=bindings,
+            full_screen=False,
+            mouse_support=False,
+            output=None,
+            input=None,
+        )
+        
         try:
-            stdscr = curses.initscr()
-            curses.noecho()
-            curses.cbreak()
-            stdscr.keypad(True)
-            stdscr.nodelay(True)
-            
-            while self.running:
-                try:
-                    key = stdscr.getch()
-                    if key != -1:
-                        if key == curses.KEY_UP or key == ord('w') or key == ord('W'):
-                            self._scroll_up()
-                        elif key == curses.KEY_DOWN or key == ord('s') or key == ord('S'):
-                            self._scroll_down()
-                        elif key == curses.KEY_PPAGE:
-                            self._page_up()
-                        elif key == curses.KEY_NPAGE:
-                            self._page_down()
-                        elif key == ord('f') or key == ord('F'):
-                            self._jump_to_recent_file()
-                    time.sleep(0.05)
-                except curses.error:
-                    time.sleep(0.1)
-        except Exception:
+            app.run()
+        except (KeyboardInterrupt, EOFError):
             pass
-        finally:
-            try:
-                curses.endwin()
-            except:
-                pass
     
     def _scroll_up(self):
         self.scroll_offset = max(0, self.scroll_offset - 5)
