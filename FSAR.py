@@ -5,7 +5,8 @@ import threading
 import subprocess
 import platform
 import difflib
-from pathlib import Path
+import queue
+from pathlib import Path 
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from watchdog.observers import Observer
@@ -67,9 +68,23 @@ class Monitor:
         self.visible_lines = 30
         self.most_recent_file = None
         self.most_recent_time = None
+        
+        # Threading and coordination
+        self.monitor_thread = None
+        self.menu_thread = None
+        self.state_lock = threading.RLock()  # For thread-safe state updates
+        self.show_menu_event = threading.Event()  # Signal to show menu
+        self.exit_event = threading.Event()  # Signal to exit application
+        self.restart_monitor_event = threading.Event()  # Signal to restart monitoring
+        self.command_queue = queue.Queue()  # For passing commands between threads
+        
+        # For keyboard navigation
         self.input_thread = None
         self.input_queue = []
         self.input_lock = threading.Lock()
+        
+        self.ptk_app = None
+        self.ptk_running = False
         
         self.chime_file = None
         if enable_chime:
@@ -626,7 +641,7 @@ class Monitor:
         
         # Build instructions with navigation and recent file info
         instructions = []
-        instructions.append("[dim]Press Ctrl+C to access menu (change path, toggle chime, exit)[/dim]")
+        instructions.append("[dim]Press [/dim][cyan]M[/cyan][dim] to access menu (change path, toggle chime, exit)[/dim]")
         if hasattr(self, 'file_idx') and self.file_idx:
             instructions.append("[dim] and view diffs.[/dim]")
         
@@ -685,209 +700,348 @@ class Monitor:
         return layout
         
     def change_path(self, new_path):
+        """Change the monitored directory path"""
         new_dir = Path(new_path).resolve()
         if not new_dir.exists():
             raise ValueError(f"Directory does not exist: {new_path}")
         
+        # Stop current monitoring
         self.stop_monitoring()
         
-        self.changed.clear()
-        self.created.clear()
-        self.deleted.clear()
-        self.contents.clear()
-        self.backups.clear()
+        with self.state_lock:
+            # Clear all tracking data
+            self.changed.clear()
+            self.created.clear()
+            self.deleted.clear()
+            self.contents.clear()
+            self.backups.clear()
+            
+            # Reset view state
+            self.scroll_offset = 0
+            self.most_recent_file = None
+            self.most_recent_time = None
+            
+            # Update directory
+            self.dir = new_dir
+            
+            # Update chime file location
+            if self.chime:
+                resource_chime = Path(get_resource_path("chime.mp3"))
+                if resource_chime.exists():
+                    self.chime_file = resource_chime
+                else:
+                    dir_chime = self.dir / "chime.mp3"
+                    self.chime_file = dir_chime if dir_chime.exists() else None
         
-        self.scroll_offset = 0
-        self.most_recent_file = None
-        self.most_recent_time = None
-        
-        self.dir = new_dir
-        
-        if self.chime:
-            resource_chime = Path(get_resource_path("chime.mp3"))
-            if resource_chime.exists():
-                self.chime_file = resource_chime
-            else:
-                dir_chime = self.dir / "chime.mp3"
-                self.chime_file = dir_chime if dir_chime.exists() else None
-        
+        # Initialize content tracking for new directory
         self._init_contents()
         
-        self.start_monitoring()
-        
     def start_monitoring(self):
+        """Start the file system monitoring"""
         if not self.dir.exists():
             raise ValueError(f"Directory does not exist: {self.dir}")
             
-        self.running = True
+        # Clean up any existing prompt_toolkit instance
+        self._kill_prompt_toolkit()
+        
+        with self.state_lock:
+            self.running = True
+        
+        # Set up the watchdog observer
         self.observer = Observer()
         event_handler = Handler(self)
         self.observer.schedule(event_handler, str(self.dir), recursive=True)
         self.observer.start()
         
+        # Clean up any existing input thread
+        if self.input_thread and self.input_thread.is_alive():
+            try:
+                self.input_thread.join(0.5)
+            except Exception:
+                pass
+        
+        # Brief pause for terminal stability
+        time.sleep(0.1)
+        
+        # Start the keyboard navigation handler
         self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
         self.input_thread.start()
-        
+    
     def check_dir_exists(self):
+        """Check if the monitored directory exists"""
         return self.dir.exists()
         
+    def _kill_prompt_toolkit(self):
+        """Forcibly terminate prompt_toolkit application"""
+        if self.ptk_running and self.ptk_app:
+            try:
+                self.ptk_running = False
+                self.ptk_app.exit()
+                self.ptk_app = None
+                time.sleep(0.1)
+            except Exception:
+                pass
+    
     def stop_monitoring(self):
-        self.running = False
+        """Stop all monitoring activities"""
+        with self.state_lock:
+            self.running = False
+        
+        # Stop the file system observer
         if self.observer:
             try:
                 self.observer.stop()
                 self.observer.join()
             except Exception:
                 pass
-            
-    def run(self):
-        self.console.print(f"[green]Starting file system monitor for: {self.dir}[/green]")
-        chime_status = "[green]ON[/green]" if self.chime else "[red]OFF[/red]"
-        self.console.print(f"[dim]Chime: {chime_status} | Interactive controls available during monitoring[/dim]")
         
-        self.start_monitoring()
+        # Kill prompt_toolkit
+        self._kill_prompt_toolkit()
         
-        self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
-        self.input_thread.start()
-        
+    def _monitoring_thread(self):
+        """Thread function for monitoring files and displaying updates"""
         try:
             with Live(self.create_display(), refresh_per_second=2, screen=True) as live:
                 counter = 0
-                while self.running:
-                    live.update(self.create_display())
+                while self.running and not self.show_menu_event.is_set() and not self.exit_event.is_set():
+                    with self.state_lock:
+                        live.update(self.create_display())
                     
                     counter += 1
                     if counter >= 10:
                         counter = 0
                         if not self.check_dir_exists():
                             self.stop_monitoring()
+                            self.show_menu_event.set()
                     
                     time.sleep(0.5)
-                        
-        except KeyboardInterrupt:
-            self.stop_monitoring()
-            while True:
-                try:
-                    dir_exists = self.check_dir_exists()
                     
-                    if not dir_exists:
-                        self.console.print("\n[red]⚠️ DIRECTORY DELETED OR MOVED![/red]")
-                        self.console.print(f"[dim]The monitored directory no longer exists: {self.dir}[/dim]")
-                        self.console.print("\n[yellow]🔧 Recovery Options:[/yellow]")
-                        self.console.print("  [cyan]1.[/cyan] Change to a different directory")
-                        self.console.print("  [cyan]2.[/cyan] Exit program")
-                        
-                        choice = input("\nEnter choice (1-2): ").strip()
-                        
-                        if choice == '1':
-                            new_path = input("Enter new directory path: ").strip()
-                            if new_path:
-                                try:
-                                    self.change_path(new_path)
-                                    self.console.print(f"[green]✅ Now monitoring: {self.dir}[/green]")
-                                    self.console.print("[green]Resuming monitoring... (Press Ctrl+C again to return to menu)[/green]")
-                                    self.start_monitoring()
-                                    
-                                    # Start input handler thread for keyboard navigation
-                                    self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
-                                    self.input_thread.start()
-                                    
-                                    with Live(self.create_display(), refresh_per_second=2, screen=True) as live:
-                                        counter = 0
-                                        while self.running:
-                                            live.update(self.create_display())
-                                            
-                                            counter += 1
-                                            if counter >= 10:
-                                                counter = 0
-                                                if not self.check_dir_exists():
-                                                    self.stop_monitoring()
-                                            
-                                            time.sleep(0.5)
-                                except ValueError as e:
-                                    self.console.print(f"[red]❌ Error: {e}[/red]")
-                            else:
-                                self.console.print("[yellow]No path entered[/yellow]")
+                    # Check if menu key was pressed
+                    if self.show_menu_event.is_set():
+                        break
+        
+        except KeyboardInterrupt:
+            self.show_menu_event.set()
+        finally:
+            self.stop_monitoring()
+            self._kill_prompt_toolkit()
+            os.system('cls' if os.name == 'nt' else 'clear')
+    
+    def _menu_thread(self):
+        """Thread function for handling menu interactions"""
+        while not self.exit_event.is_set():
+            # Wait for signal to show menu
+            self.show_menu_event.wait()
+            
+            if self.exit_event.is_set():
+                break
+                
+            # Clear any lingering menu signal
+            self.show_menu_event.clear()
+            
+            # Make sure monitoring is stopped and input is clean
+            self.stop_monitoring()
+            self._kill_prompt_toolkit()
+            
+            # Add delay to ensure terminal is ready
+            time.sleep(0.3)
+            
+            # Clear screen and reset terminal state
+            os.system('cls' if os.name == 'nt' else 'clear')
+            
+            # Handle the menu
+            self._handle_menu()
+            
+            # If we need to restart monitoring, do so
+            if self.restart_monitor_event.is_set() and not self.exit_event.is_set():
+                self.restart_monitor_event.clear()
+                self.start_monitoring()
+                
+                # Start new monitoring thread
+                self.monitor_thread = threading.Thread(target=self._monitoring_thread, daemon=True)
+                self.monitor_thread.start()
+    
+    def _ensure_input_ready(self):
+        """Ensure the terminal is ready to receive input"""
+        # Kill any running prompt_toolkit instance
+        self._kill_prompt_toolkit()
+        
+        # Add delay to ensure terminal buffer is flushed
+        time.sleep(0.2)
+        
+        # Clear the screen for clean input
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
+        # Add a small delay to ensure terminal is settled
+        time.sleep(0.2)
+        
+        # Force terminal to normal mode on Unix-like platforms
+        if platform.system() != "Windows":
+            try:
+                # Reset terminal modes
+                os.system("stty sane")
+                os.system("stty echo")  # Ensure echo is on
+                # Short delay for terminal to stabilize
+                time.sleep(0.2)
+            except:
+                pass
+                
+        # Print a separator to ensure terminal is in a known good state
+        print("\n" + "-" * 60 + "\n")
+    
+    def _handle_menu(self):
+        """Handles the menu display and interaction"""
+        while not self.exit_event.is_set():
+            try:
+                # Prepare terminal for input
+                self._ensure_input_ready()
+                
+                # Print a message to confirm the menu is being displayed
+                print("Loading FSAR menu...\n")
+                
+                dir_exists = self.check_dir_exists()
+                
+                if not dir_exists:
+                    self.console.print("\n[red]⚠️ DIRECTORY DELETED OR MOVED![/red]")
+                    self.console.print(f"[dim]The monitored directory no longer exists: {self.dir}[/dim]")
+                    self.console.print("\n[yellow]🔧 Recovery Options:[/yellow]")
+                    self.console.print("  [cyan]1.[/cyan] Change to a different directory")
+                    self.console.print("  [cyan]2.[/cyan] Exit program")
+                    
+                    choice = input("\nEnter choice (1-2): ").strip()
+                    
+                    if choice == '1':
+                        self._ensure_input_ready()
+                        new_path = input("Enter new directory path: ").strip()
+                        if new_path:
+                            try:
+                                self.change_path(new_path)
+                                self.console.print(f"[green]✅ Now monitoring: {self.dir}[/green]")
+                                self.console.print("[green]Resuming monitoring... (Press 'M' key to return to menu)[/green]")
                                 
-                        elif choice == '2':
-                            break
+                                # Signal to restart monitoring
+                                self.restart_monitor_event.set()
+                                return
+                            except ValueError as e:
+                                self.console.print(f"[red]❌ Error: {e}[/red]")
                         else:
-                            self.console.print("[red]Invalid choice. Please enter 1 or 2.[/red]")
+                            self.console.print("[yellow]No path entered[/yellow]")
+                    elif choice == '2':
+                        self.exit_event.set()
+                        return
                     else:
-                        self.console.print("\n[yellow]🔧 Monitor Controls:[/yellow]")
-                        self.console.print("  [cyan]1.[/cyan] Change directory path")
-                        self.console.print("  [cyan]2.[/cyan] Toggle chime notifications")
-                        self.console.print("  [cyan]3.[/cyan] View file diffs")
-                        self.console.print("  [cyan]4.[/cyan] Resume monitoring")
-                        self.console.print("  [cyan]5.[/cyan] Exit")
-                        
-                        choice = input("\nEnter choice (1-5): ").strip()
-                        
-                        if choice == '1':
-                            new_path = input("Enter new directory path: ").strip()
-                            if new_path:
-                                try:
-                                    self.change_path(new_path)
-                                    self.console.print(f"[green]✅ Now monitoring: {self.dir}[/green]")
-                                except ValueError as e:
-                                    self.console.print(f"[red]❌ Error: {e}[/red]")
-                            else:
-                                self.console.print("[yellow]No path entered[/yellow]")
+                        self.console.print("[red]Invalid choice. Please enter 1 or 2.[/red]")
+                else:
+                    # Print with higher visibility
+                    print("\n" + "=" * 60)
+                    self.console.print("\n[bold yellow]🔧 FSAR MONITOR CONTROLS:[/bold yellow]")
+                    print("-" * 60 + "\n")
+                    self.console.print("  [bold cyan]1.[/bold cyan] Change directory path")
+                    self.console.print("  [bold cyan]2.[/bold cyan] Toggle chime notifications")
+                    self.console.print("  [bold cyan]3.[/bold cyan] View file diffs")
+                    self.console.print("  [bold cyan]4.[/bold cyan] Resume monitoring")
+                    self.console.print("  [bold cyan]5.[/bold cyan] Exit")
+                    print("\n" + "=" * 60)
+                    
+                    choice = input("\nEnter choice (1-5): ").strip()
+                    
+                    if choice == '1':
+                        new_path = input("Enter new directory path: ").strip()
+                        if new_path:
+                            try:
+                                self.change_path(new_path)
+                                self.console.print(f"[green]✅ Now monitoring: {self.dir}[/green]")
                                 
-                        elif choice == '2':
+                                # Signal to restart monitoring with new path
+                                self.restart_monitor_event.set()
+                                return
+                            except ValueError as e:
+                                self.console.print(f"[red]❌ Error: {e}[/red]")
+                        else:
+                            self.console.print("[yellow]No path entered[/yellow]")
+                            
+                    elif choice == '2':
+                        with self.state_lock:
                             self.chime = not self.chime
                             chime_status = "[green]ON[/green]" if self.chime else "[red]OFF[/red]"
                             self.console.print(f"[blue]🔔 Chime toggled: {chime_status}[/blue]")
-                            
-                            if self.chime and not self.chime_file.exists():
-                                self.console.print(f"[yellow]⚠️ Note: chime.mp3 not found at {self.chime_file}[/yellow]")
-                                self.console.print(f"[dim]Audio notifications will be disabled until chime.mp3 is available[/dim]")
-                                
-                        elif choice == '3':
-                            self._show_diff_menu()
-                                
-                        elif choice == '4':
-                            self.console.print("[green]Resuming monitoring... (Press Ctrl+C again to return to menu)[/green]")
-                            self.start_monitoring()
-                            
-                            self.input_thread = threading.Thread(target=self._input_handler, daemon=True)
-                            self.input_thread.start()
-                            
-                            with Live(self.create_display(), refresh_per_second=2, screen=True) as live:
-                                counter = 0
-                                while self.running:
-                                    live.update(self.create_display())
-                                    
-                                    counter += 1
-                                    if counter >= 10:
-                                        counter = 0
-                                        if not self.check_dir_exists():
-                                            self.stop_monitoring()
-                                    
-                                    time.sleep(0.5)
-                                    
-                        elif choice == '5':
-                            break
-                            
-                        else:
-                            self.console.print("[red]Invalid choice. Please enter 1-5.[/red]")
                         
-                except KeyboardInterrupt:
-                    continue
-                except EOFError:
-                    break
-                    
+                        if self.chime and not self.chime_file.exists():
+                            self.console.print(f"[yellow]⚠️ Note: chime.mp3 not found at {self.chime_file}[/yellow]")
+                            self.console.print(f"[dim]Audio notifications will be disabled until chime.mp3 is available[/dim]")
+                            
+                    elif choice == '3':
+                        self._show_diff_menu()
+                            
+                    elif choice == '4':
+                        self.console.print("[green]Resuming monitoring... (Press 'M' key to return to menu)[/green]")
+                        
+                        # Signal to restart monitoring
+                        self.restart_monitor_event.set()
+                        return
+                        
+                    elif choice == '5':
+                        self.exit_event.set()
+                        return
+                        
+                    else:
+                        self.console.print("[red]Invalid choice. Please enter 1-5.[/red]")
+            
+            except KeyboardInterrupt:
+                continue
+        
+    def run(self):
+        """Main entry point to start the application"""
+        self.console.print(f"[green]Starting file system monitor for: {self.dir}[/green]")
+        chime_status = "[green]ON[/green]" if self.chime else "[red]OFF[/red]"
+        self.console.print(f"[dim]Chime: {chime_status} | Interactive controls available during monitoring[/dim]")
+        
+        # Initialize the events
+        self.exit_event.clear()
+        self.show_menu_event.clear()
+        self.restart_monitor_event.clear()
+        
+        # Start file monitoring
+        self.start_monitoring()
+        
+        # Start the menu thread (runs in background waiting for signals)
+        self.menu_thread = threading.Thread(target=self._menu_thread, daemon=True)
+        self.menu_thread.start()
+        
+        # Start the monitoring thread
+        self.monitor_thread = threading.Thread(target=self._monitoring_thread, daemon=True)
+        self.monitor_thread.start()
+        
+        # Wait for application to exit
+        try:
+            while not self.exit_event.is_set():
+                time.sleep(0.5)
+                
+        except KeyboardInterrupt:
+            # Alternative way to exit
+            self.exit_event.set()
+            
         finally:
+            # Clean up on exit
             self.stop_monitoring()
+            self._kill_prompt_toolkit()
             self.console.print("\n[yellow]Monitoring stopped.[/yellow]")
+
     
     def _show_diff_menu(self):
+        """Show available file diffs and allow selection"""
+        # Ensure terminal is clean and ready for input
+        self._ensure_input_ready()
+        
+        # Build file tree to populate diff indexes
         tree = self.build_tree()
         
+        # Check if there are any files with diffs
         if not hasattr(self, 'file_idx') or not self.file_idx:
             self.console.print("[yellow]No files with diffs available.[/yellow]")
             return
         
+        # Show available files with diffs
         self.console.print("\n[bold blue]📄 Files with Available Diffs:[/bold blue]")
         for num, path in self.file_idx.items():
             name = Path(path).name
@@ -931,6 +1085,9 @@ class Monitor:
             
     def _input_handler(self):
         """Cross-platform input handler using prompt_toolkit"""
+        if not self.running:
+            return
+            
         bindings = KeyBindings()
         
         @bindings.add('w')
@@ -957,6 +1114,23 @@ class Monitor:
         @bindings.add('F')
         def jump_handler(event):
             self._jump_to_recent_file()
+            
+        @bindings.add('m')
+        @bindings.add('M')
+        def menu_handler(event):
+            # Signal to show the menu and exit this handler
+            with self.state_lock:
+                self.show_menu_event.set()
+            event.app.exit()
+        
+        @bindings.add(Keys.Escape)
+        def escape_handler(event):
+            # Alternative way to access menu
+            with self.state_lock:
+                self.show_menu_event.set()
+            event.app.exit()
+        
+        self.ptk_running = True
         
         app = Application(
             layout=PTKLayout(Window()),
@@ -967,10 +1141,28 @@ class Monitor:
             input=None,
         )
         
+        self.ptk_app = app
+        
         try:
-            app.run()
-        except (KeyboardInterrupt, EOFError):
+            if self.running:
+                def exit_checker():
+                    while self.ptk_running and self.running and not self.show_menu_event.is_set():
+                        time.sleep(0.2)
+                    if self.ptk_app:
+                        try:
+                            self.ptk_app.exit()
+                        except:
+                            pass
+                
+                exit_thread = threading.Thread(target=exit_checker, daemon=True)
+                exit_thread.start()
+                
+                app.run()
+        except Exception:
             pass
+        finally:
+            self.ptk_running = False
+            self.ptk_app = None
     
     def _scroll_up(self):
         self.scroll_offset = max(0, self.scroll_offset - 5)
